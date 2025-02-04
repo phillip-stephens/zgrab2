@@ -1,12 +1,14 @@
 package zgrab2
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"sync"
 
 	log "github.com/sirupsen/logrus"
+
 	"github.com/zmap/zgrab2/lib/output"
 )
 
@@ -20,10 +22,12 @@ type Grab struct {
 
 // ScanTarget is the host that will be scanned
 type ScanTarget struct {
-	IP     net.IP
-	Domain string
-	Tag    string
-	Port   *uint
+	SrcIP   *net.IP // use if non-nil
+	SrcPort uint    // use if non-zero
+	IP      net.IP
+	Domain  string
+	Tag     string
+	Port    *uint
 }
 
 func (target ScanTarget) String() string {
@@ -57,7 +61,8 @@ func (target *ScanTarget) Host() string {
 }
 
 // Open connects to the ScanTarget using the configured flags, and returns a net.Conn that uses the configured timeouts for Read/Write operations.
-func (target *ScanTarget) Open(flags *BaseFlags) (net.Conn, error) {
+// If ctxDialer is non-nil, it will be used to establish the connection using the flags.Timeout as the dial timeout. Additionally, ctxDialer will  override any SourceIP or SourcePort set in the ScanTarget.
+func (target *ScanTarget) Open(flags *BaseFlags, ctxDialer ContextDialer) (net.Conn, error) {
 	var port uint
 	// If the port is supplied in ScanTarget, let that override the cmdline option
 	if target.Port != nil {
@@ -67,14 +72,25 @@ func (target *ScanTarget) Open(flags *BaseFlags) (net.Conn, error) {
 	}
 
 	address := net.JoinHostPort(target.Host(), fmt.Sprintf("%d", port))
-	return DialTimeoutConnection("tcp", address, flags.Timeout, flags.BytesReadLimit)
+	if ctxDialer != nil {
+		// If dialer provided, use it
+		ctx, cancel := context.WithTimeout(context.Background(), flags.Timeout)
+		defer cancel()
+		return ctxDialer(ctx, "tcp", address)
+	}
+	// attempt to get a local addr
+	localAddr, _ := GetLocalAddr("tcp", *target.SrcIP, target.SrcPort)
+	// Dial Timeout will ignore localAddr if it is nil
+	return DialTimeoutConnection("tcp", address, localAddr, flags.Timeout, flags.BytesReadLimit)
 }
 
 // OpenTLS connects to the ScanTarget using the configured flags, then performs
 // the TLS handshake. On success error is nil, but the connection can be non-nil
 // even if there is an error (this allows fetching the handshake log).
-func (target *ScanTarget) OpenTLS(baseFlags *BaseFlags, tlsFlags *TLSFlags) (*TLSConnection, error) {
-	conn, err := tlsFlags.Connect(target, baseFlags)
+// If ctxDialer is non-nil, it will be used to establish the connection using the flags.Timeout as the dial timeout.
+// Additionally, ctxDialer will  override any SourceIP or SourcePort set in the ScanTarget.
+func (target *ScanTarget) OpenTLS(baseFlags *BaseFlags, tlsFlags *TLSFlags, ctxDialer ContextDialer) (*TLSConnection, error) {
+	conn, err := tlsFlags.Connect(target, baseFlags, ctxDialer)
 	if err != nil {
 		return conn, err
 	}
@@ -84,7 +100,8 @@ func (target *ScanTarget) OpenTLS(baseFlags *BaseFlags, tlsFlags *TLSFlags) (*TL
 
 // OpenUDP connects to the ScanTarget using the configured flags, and returns a net.Conn that uses the configured timeouts for Read/Write operations.
 // Note that the UDP "connection" does not have an associated timeout.
-func (target *ScanTarget) OpenUDP(flags *BaseFlags, udp *UDPFlags) (net.Conn, error) {
+// Source IP/Port set in scan target takes precedence over flags.
+func (target *ScanTarget) OpenUDP(flags *BaseFlags, udp *UDPFlags, dialer ContextDialer) (net.Conn, error) {
 	var port uint
 	// If the port is supplied in ScanTarget, let that override the cmdline option
 	if target.Port != nil {
@@ -93,8 +110,19 @@ func (target *ScanTarget) OpenUDP(flags *BaseFlags, udp *UDPFlags) (net.Conn, er
 		port = flags.Port
 	}
 	address := net.JoinHostPort(target.Host(), fmt.Sprintf("%d", port))
+	if dialer != nil {
+		// If dialer provided, use it
+		ctx, cancel := context.WithTimeout(context.Background(), flags.Timeout)
+		defer cancel()
+		return dialer(ctx, "udp", address)
+	}
+	// Otherwise, use the default dialer
+	// attempt to get a local addr, scan target takes precedence over flags
 	var local *net.UDPAddr
-	if udp != nil && (udp.LocalAddress != "" || udp.LocalPort != 0) {
+	if target.SrcIP != nil || target.SrcPort != 0 {
+		local.IP = *target.SrcIP
+		local.Port = int(target.SrcPort)
+	} else if udp != nil && (udp.LocalAddress != "" || udp.LocalPort != 0) {
 		local = &net.UDPAddr{}
 		if udp.LocalAddress != "" && udp.LocalAddress != "*" {
 			local.IP = net.ParseIP(udp.LocalAddress)
@@ -213,7 +241,9 @@ func Process(mon *Monitor) {
 		go func(i int) {
 			for _, scannerName := range orderedScanners {
 				scanner := *scanners[scannerName]
-				scanner.InitPerSender(i)
+				if err := scanner.InitPerSender(i); err != nil {
+					log.Fatalf("Error initializing scanner %s for sender %d: %v", scannerName, i, err)
+				}
 			}
 			for obj := range processQueue {
 				for run := uint(0); run < uint(config.ConnectionsPerHost); run++ {
